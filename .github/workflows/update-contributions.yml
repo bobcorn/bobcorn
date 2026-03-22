@@ -1,0 +1,292 @@
+name: Update Contributions
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      EMAIL: ${{ secrets.EMAIL }}
+      TOKEN: ${{ secrets.TOKEN }}
+      README_PATH: README.md
+      README_START_MARKER: <!-- CONTRIBUTIONS-START -->
+      README_END_MARKER: <!-- CONTRIBUTIONS-END -->
+      TARGET_USER: ${{ github.repository_owner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.TOKEN }}
+
+      - name: Update README contributions table
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const README_PATH = path.resolve(process.env.README_PATH);
+            const README_START_MARKER = process.env.README_START_MARKER;
+            const README_END_MARKER = process.env.README_END_MARKER;
+            const TARGET_USER = process.env.TARGET_USER;
+            const ONE_SECOND_MS = 1000;
+            const NOW_MS = Math.floor(Date.now() / ONE_SECOND_MS) * ONE_SECOND_MS;
+            const SEARCH_PAGE_SIZE = 100;
+            const SEARCH_RESULT_LIMIT = 1000;
+            const BASE_SEARCH_TERMS = [
+              'is:pr',
+              'is:merged',
+              'is:public',
+              'sort:updated-desc',
+              `author:${TARGET_USER}`,
+              `-user:${TARGET_USER}`,
+            ];
+            const CONTRIBUTION_YEARS_QUERY = `
+              query ContributionYears($login: String!) {
+                user(login: $login) {
+                  contributionsCollection {
+                    contributionYears
+                  }
+                }
+              }
+            `;
+            const SEARCH_PULL_REQUESTS_QUERY = `
+              query SearchPullRequests($searchQuery: String!, $cursor: String) {
+                search(query: $searchQuery, type: ISSUE, first: ${SEARCH_PAGE_SIZE}, after: $cursor) {
+                  issueCount
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                  nodes {
+                    ... on PullRequest {
+                      mergedAt
+                      repository {
+                        nameWithOwner
+                        url
+                        description
+                        isPrivate
+                        owner {
+                          login
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            function sanitizeDescription(value) {
+              return (value ?? '—')
+                .replace(/\r?\n/g, ' ')
+                .replace(/\|/g, '\\|')
+                .replace(/\s{2,}/g, ' ')
+                .trim();
+            }
+
+            async function fetchContributionYears() {
+              const response = await github.graphql(CONTRIBUTION_YEARS_QUERY, {
+                login: TARGET_USER,
+              });
+
+              return response.user?.contributionsCollection?.contributionYears ?? [];
+            }
+
+            function formatSearchTimestamp(milliseconds) {
+              return new Date(milliseconds).toISOString().replace('.000Z', 'Z');
+            }
+
+            function buildSearchQuery(rangeStartMs, rangeEndMs) {
+              return [
+                ...BASE_SEARCH_TERMS,
+                `merged:${formatSearchTimestamp(rangeStartMs)}..${formatSearchTimestamp(
+                  rangeEndMs,
+                )}`,
+              ].join(' ');
+            }
+
+            async function fetchSearchPage(searchQuery, cursor = null) {
+              return github.graphql(SEARCH_PULL_REQUESTS_QUERY, {
+                searchQuery,
+                cursor,
+              });
+            }
+
+            function addPullRequestsToSummaries(nodes, summaries) {
+              for (const pullRequest of nodes) {
+                if (!pullRequest?.repository || !pullRequest.mergedAt) {
+                  continue;
+                }
+
+                const repository = pullRequest.repository;
+                if (repository.isPrivate || repository.owner.login === TARGET_USER) {
+                  continue;
+                }
+
+                const existingSummary = summaries.get(repository.nameWithOwner);
+                if (existingSummary) {
+                  existingSummary.count += 1;
+                  if (pullRequest.mergedAt > existingSummary.latestMergedAt) {
+                    existingSummary.latestMergedAt = pullRequest.mergedAt;
+                  }
+                  continue;
+                }
+
+                summaries.set(repository.nameWithOwner, {
+                  nameWithOwner: repository.nameWithOwner,
+                  url: repository.url,
+                  description: sanitizeDescription(repository.description),
+                  count: 1,
+                  latestMergedAt: pullRequest.mergedAt,
+                });
+              }
+            }
+
+            function buildYearRanges(years) {
+              const currentYear = new Date(NOW_MS).getUTCFullYear();
+
+              return [...years]
+                .sort((left, right) => left - right)
+                .map((year) => ({
+                  startMs: Date.UTC(year, 0, 1, 0, 0, 0),
+                  endMs:
+                    year === currentYear
+                      ? NOW_MS
+                      : Date.UTC(year + 1, 0, 1, 0, 0, 0) - ONE_SECOND_MS,
+                }));
+            }
+
+            async function collectRange(rangeStartMs, rangeEndMs, summaries) {
+              const searchQuery = buildSearchQuery(rangeStartMs, rangeEndMs);
+              const initialResponse = await fetchSearchPage(searchQuery);
+              const totalMatches = initialResponse.search.issueCount;
+
+              if (totalMatches === 0) {
+                return;
+              }
+
+              if (totalMatches > SEARCH_RESULT_LIMIT) {
+                const rangeDurationMs = rangeEndMs - rangeStartMs;
+
+                if (rangeDurationMs <= ONE_SECOND_MS) {
+                  throw new Error(
+                    `Search window still exceeds ${SEARCH_RESULT_LIMIT} results at second-level precision.`,
+                  );
+                }
+
+                const midpointMs =
+                  rangeStartMs +
+                  Math.floor(rangeDurationMs / (2 * ONE_SECOND_MS)) * ONE_SECOND_MS;
+
+                await collectRange(rangeStartMs, midpointMs, summaries);
+                await collectRange(midpointMs + ONE_SECOND_MS, rangeEndMs, summaries);
+                return;
+              }
+
+              addPullRequestsToSummaries(initialResponse.search.nodes, summaries);
+              let cursor = initialResponse.search.pageInfo.endCursor;
+              let hasNextPage = initialResponse.search.pageInfo.hasNextPage;
+
+              while (hasNextPage) {
+                const response = await fetchSearchPage(searchQuery, cursor);
+                addPullRequestsToSummaries(response.search.nodes, summaries);
+                cursor = response.search.pageInfo.endCursor;
+                hasNextPage = response.search.pageInfo.hasNextPage;
+              }
+            }
+
+            async function fetchRepositorySummaries() {
+              const summaries = new Map();
+              const yearRanges = buildYearRanges(await fetchContributionYears());
+
+              for (const yearRange of yearRanges) {
+                await collectRange(yearRange.startMs, yearRange.endMs, summaries);
+              }
+
+              return Array.from(summaries.values()).sort((left, right) =>
+                right.latestMergedAt.localeCompare(left.latestMergedAt),
+              );
+            }
+
+            function buildPullRequestFilterUrl(repositoryUrl) {
+              const query = encodeURIComponent(`is:pr is:merged author:${TARGET_USER}`);
+              return `${repositoryUrl}/pulls?q=${query}`;
+            }
+
+            function buildContributionsTable(repositories) {
+              if (repositories.length === 0) {
+                return '_No merged contributions yet._\n';
+              }
+
+              const rows = repositories.map((repository) => {
+                const repositoryLink = `[${repository.nameWithOwner}](${repository.url})`;
+                const pullRequestLink = `[${repository.count}](${buildPullRequestFilterUrl(
+                  repository.url,
+                )})`;
+                return `| ${repositoryLink} | ${repository.description} | ${pullRequestLink} |`;
+              });
+
+              return [
+                '| Repository | Description | PRs |',
+                '|---|---|---|',
+                ...rows,
+              ].join('\n') + '\n';
+            }
+
+            function replaceSection(content, replacement) {
+              const startIndex = content.indexOf(README_START_MARKER);
+              const endIndex = content.indexOf(README_END_MARKER);
+
+              if (startIndex === -1 || endIndex === -1 || endIndex < startIndex) {
+                throw new Error(
+                  `Contribution markers not found or invalid in ${README_PATH}`,
+                );
+              }
+
+              return (
+                content.slice(0, startIndex + README_START_MARKER.length) +
+                '\n' +
+                replacement +
+                content.slice(endIndex)
+              );
+            }
+
+            const repositories = await fetchRepositorySummaries();
+            const mergedPullRequestCount = repositories.reduce(
+              (count, repository) => count + repository.count,
+              0,
+            );
+            const contributionsTable = buildContributionsTable(repositories);
+            const currentReadme = fs.readFileSync(README_PATH, 'utf8');
+            const updatedReadme = replaceSection(currentReadme, contributionsTable);
+
+            fs.writeFileSync(README_PATH, updatedReadme, 'utf8');
+
+            core.info(
+              `Fetched ${mergedPullRequestCount} merged pull requests across ${repositories.length} repositories.`,
+            );
+
+      - name: Create orphan commit and force-push
+        run: |
+          set -euo pipefail
+
+          : "${EMAIL:?EMAIL secret is required}"
+
+          git config user.name "Marco Rossini"
+          git config user.email "$EMAIL"
+
+          git checkout --orphan rewrite-profile-branch
+          git add -A
+          git commit -m "docs: updated README.md"
+
+          git push origin HEAD:"${{ github.event.repository.default_branch }}" --force
